@@ -756,13 +756,23 @@ async fn system_package_manager(
     kind: vp_pm_cli::PackageManagerType,
     executable: &vt_path::AbsolutePath,
 ) -> Option<vp_pm_cli::PackageManager> {
-    let output =
-        tokio::process::Command::new(executable.as_path()).arg("--version").output().await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = std::str::from_utf8(&output.stdout).ok()?.trim();
-    js_semver::Version::parse(version).ok()?;
+    let version = if kind == vp_pm_cli::PackageManagerType::Npm
+        && let Some(version) = vp_pm_cli::npm_version_from_package_json(executable)
+    {
+        version.to_string()
+    } else {
+        let output = tokio::process::Command::new(executable.as_path())
+            .arg("--version")
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let version = std::str::from_utf8(&output.stdout).ok()?.trim();
+        js_semver::Version::parse(version).ok()?;
+        version.to_owned()
+    };
     let bin_prefix = executable.parent()?.to_absolute_path_buf();
     Some(vp_pm_cli::PackageManager::from_bin_prefix(kind, version, bin_prefix))
 }
@@ -1320,7 +1330,7 @@ mod tests {
     use super::{
         Commands, display_node_version, has_flag_before_terminator, is_same_node_version,
         raw_subcommand, should_force_global_delegate, should_suppress_header_for_subcommand,
-        try_parse_args_from,
+        system_package_manager, try_parse_args_from,
     };
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -1446,5 +1456,29 @@ mod tests {
     #[test]
     fn unknown_subcommand_does_not_suppress_header() {
         assert!(!should_suppress_header_for_subcommand("test", &["--lsp".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_npm_version_is_read_from_its_package_without_running_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let package = root.join("lib/node_modules/npm");
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"name":"npm","version":"10.9.2"}"#)
+            .unwrap();
+        // Running this npm fails, so a spawned `npm --version` would return `None`.
+        let cli = package.join("bin/npm-cli.js");
+        std::fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink("../lib/node_modules/npm/bin/npm-cli.js", root.join("bin/npm"))
+            .unwrap();
+        let npm = vt_path::AbsolutePathBuf::new(root.join("bin/npm")).unwrap();
+
+        let manager = system_package_manager(vp_pm_cli::PackageManagerType::Npm, &npm).await;
+        assert!(manager.is_some());
     }
 }
